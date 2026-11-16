@@ -1,0 +1,30 @@
+name: Validate workflows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Lint workflows
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Install test runner
+        run: gem install minitest --version '~> 5.25' --no-document
+
+      - name: Test Writerside workflow behavior
+        run: ruby tests/writerside_pages_test.rb

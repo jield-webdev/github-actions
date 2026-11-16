@@ -1,0 +1,50 @@
+name: Documentation
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - "release/**"
+    tags:
+      - "v*"
+    paths:
+      - "Writerside/**"
+      - ".github/workflows/documentation.yml"
+  pull_request:
+    branches:
+      - main
+      - develop
+      - "release/**"
+    paths:
+      - "Writerside/**"
+      - ".github/workflows/documentation.yml"
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: "Optional vX.Y.Z tag to add or rebuild without changing the current documentation"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Pages is one site. Serialise publishing runs so two branches cannot update
+# the persistent gh-pages content store at the same time.
+concurrency:
+  group: documentation-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  documentation:
+    uses: jield-webdev/github-actions/.github/workflows/writerside-pages.yml@v1
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    with:
+      instance: Writerside/ipm
+      docker-version: "2026.10.0423"
+      site-url: https://example.github.io/project
+      # custom-domain: docs.example.com
+      release-ref: ${{ inputs.release_ref || '' }}

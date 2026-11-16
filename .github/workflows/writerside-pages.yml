@@ -1,0 +1,490 @@
+name: Writerside Pages
+
+on:
+  workflow_call:
+    inputs:
+      instance:
+        description: "Writerside directory and instance ID, for example Writerside/ipm"
+        required: true
+        type: string
+      docker-version:
+        description: "Writerside builder Docker image version"
+        required: true
+        type: string
+      site-url:
+        description: "Public site URL, including any project base path"
+        required: true
+        type: string
+      custom-domain:
+        description: "Optional domain to write to CNAME; empty preserves an existing CNAME"
+        required: false
+        default: ""
+        type: string
+      release-ref:
+        description: "Optional vX.Y.Z tag to add or rebuild during workflow_dispatch"
+        required: false
+        default: ""
+        type: string
+      current-branch:
+        description: "Branch used for current documentation at the site root"
+        required: false
+        default: main
+        type: string
+      develop-branch:
+        description: "Branch published under /develop/"
+        required: false
+        default: develop
+        type: string
+      content-branch:
+        description: "Branch retaining the published site and historical releases"
+        required: false
+        default: gh-pages
+        type: string
+      environment:
+        description: "GitHub environment used by the Pages deployment job"
+        required: false
+        default: github-pages
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  INSTANCE: ${{ inputs.instance }}
+  DOCKER_VERSION: ${{ inputs.docker-version }}
+  SITE_URL: ${{ inputs.site-url }}
+  CUSTOM_DOMAIN: ${{ inputs.custom-domain }}
+  CURRENT_BRANCH: ${{ inputs.current-branch }}
+  DEVELOP_BRANCH: ${{ inputs.develop-branch }}
+  CONTENT_BRANCH: ${{ inputs.content-branch }}
+
+# The caller owns event filters and publishing concurrency. Checkout steps in
+# this workflow operate on the caller's repository, including its content store.
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.versions.outputs.matrix }}
+      deploy: ${{ steps.versions.outputs.deploy }}
+      root_id: ${{ steps.versions.outputs.root_id }}
+      root_version: ${{ steps.versions.outputs.root_version }}
+      release_id: ${{ steps.versions.outputs.release_id }}
+      release_version: ${{ steps.versions.outputs.release_version }}
+      release_label: ${{ steps.versions.outputs.release_label }}
+
+    steps:
+      - name: Select documentation versions
+        id: versions
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          MANUAL_RELEASE_REF: ${{ inputs.release-ref }}
+        run: |
+          set -euo pipefail
+
+          DEPLOY=false
+          ROOT_ID=""
+          ROOT_VERSION=""
+          RELEASE_ID=""
+          RELEASE_VERSION=""
+          RELEASE_LABEL=""
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            MATRIX=$(jq -cn --arg ref "$COMMIT_SHA" '[
+              {id: "check", ref: $ref, channel: "check", version: ""}
+            ]')
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" && -n "$MANUAL_RELEASE_REF" ]]; then
+            RELEASE_VERSION="${MANUAL_RELEASE_REF#refs/tags/}"
+            RELEASE_VERSION="${RELEASE_VERSION#v}"
+            if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+(\.[0-9]+){2}([.-][0-9A-Za-z.-]+)?$ ]]; then
+              echo "Unsupported release tag: $MANUAL_RELEASE_REF" >&2
+              exit 1
+            fi
+
+            DEPLOY=true
+            ROOT_ID="main"
+            RELEASE_ID="release-${RELEASE_VERSION}"
+            RELEASE_LABEL="$RELEASE_VERSION"
+            MATRIX=$(jq -cn \
+              --arg currentRef "$CURRENT_BRANCH" \
+              --arg developRef "$DEVELOP_BRANCH" \
+              --arg releaseRef "$MANUAL_RELEASE_REF" \
+              --arg releaseId "$RELEASE_ID" \
+              --arg version "$RELEASE_VERSION" \
+              '[
+                {id: "main", ref: $currentRef, channel: "current", version: ""},
+                {id: "develop", ref: $developRef, channel: "develop", version: ""},
+                {id: $releaseId, ref: $releaseRef, channel: "release", version: $version}
+              ]')
+          elif [[ "$REF" == "refs/tags/v"* ]]; then
+            RELEASE_VERSION="${REF_NAME#v}"
+            if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+(\.[0-9]+){2}([.-][0-9A-Za-z.-]+)?$ ]]; then
+              echo "Unsupported release tag: $REF_NAME" >&2
+              exit 1
+            fi
+
+            DEPLOY=true
+            ROOT_ID="current-${RELEASE_VERSION}"
+            ROOT_VERSION="$RELEASE_VERSION"
+            RELEASE_ID="release-${RELEASE_VERSION}"
+            RELEASE_LABEL="$RELEASE_VERSION"
+            MATRIX=$(jq -cn \
+              --arg ref "$COMMIT_SHA" \
+              --arg developRef "$DEVELOP_BRANCH" \
+              --arg rootId "$ROOT_ID" \
+              --arg releaseId "$RELEASE_ID" \
+              --arg version "$RELEASE_VERSION" \
+              '[
+                {id: "develop", ref: $developRef, channel: "develop", version: ""},
+                {id: $rootId, ref: $ref, channel: "current", version: $version},
+                {id: $releaseId, ref: $ref, channel: "release", version: $version}
+              ]')
+          elif [[ "$REF" == "refs/heads/$CURRENT_BRANCH" || "$REF" == "refs/heads/$DEVELOP_BRANCH" || "$REF" == "refs/heads/release/"* ]]; then
+            DEPLOY=true
+            MAIN_REF="$CURRENT_BRANCH"
+            DEVELOP_REF="$DEVELOP_BRANCH"
+            [[ "$REF" == "refs/heads/$CURRENT_BRANCH" ]] && MAIN_REF="$COMMIT_SHA"
+            [[ "$REF" == "refs/heads/$DEVELOP_BRANCH" ]] && DEVELOP_REF="$COMMIT_SHA"
+
+            ROOT_ID="main"
+            MATRIX=$(jq -cn \
+              --arg mainRef "$MAIN_REF" \
+              --arg developRef "$DEVELOP_REF" \
+              '[
+                {id: "main", ref: $mainRef, channel: "current", version: ""},
+                {id: "develop", ref: $developRef, channel: "develop", version: ""}
+              ]')
+
+            if [[ "$REF" == "refs/heads/release/"* ]]; then
+              RELEASE_VERSION="${REF_NAME#release/}"
+              if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z.-]+)?$ ]]; then
+                echo "Unsupported release branch: $REF_NAME" >&2
+                exit 1
+              fi
+
+              RELEASE_ID="release-${RELEASE_VERSION}"
+              RELEASE_LABEL="${RELEASE_VERSION} Preview"
+              MATRIX=$(jq -cn \
+                --argjson matrix "$MATRIX" \
+                --arg id "$RELEASE_ID" \
+                --arg ref "$COMMIT_SHA" \
+                --arg version "$RELEASE_VERSION" \
+                '$matrix + [{id: $id, ref: $ref, channel: "release-preview", version: $version}]')
+            fi
+          else
+            MATRIX=$(jq -cn --arg ref "$COMMIT_SHA" '[
+              {id: "check", ref: $ref, channel: "check", version: ""}
+            ]')
+          fi
+
+          {
+            echo "matrix=$MATRIX"
+            echo "deploy=$DEPLOY"
+            echo "root_id=$ROOT_ID"
+            echo "root_version=$ROOT_VERSION"
+            echo "release_id=$RELEASE_ID"
+            echo "release_version=$RELEASE_VERSION"
+            echo "release_label=$RELEASE_LABEL"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        docs: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout ${{ matrix.docs.id }} documentation
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.docs.ref }}
+          fetch-depth: 0
+
+      - name: Configure ${{ matrix.docs.id }} documentation
+        shell: bash
+        env:
+          DOCS_CHANNEL: ${{ matrix.docs.channel }}
+          DOCS_VERSION: ${{ matrix.docs.version }}
+        run: |
+          set -euo pipefail
+
+          SITE_URL="${SITE_URL%/}"
+          WRITERSIDE_DIR="${INSTANCE%/*}"
+
+          case "$DOCS_CHANNEL" in
+            current)
+              WEB_ROOT="$SITE_URL"
+              NOINDEX=false
+              ;;
+            develop)
+              WEB_ROOT="$SITE_URL/develop"
+              NOINDEX=true
+              ;;
+            release-preview)
+              WEB_ROOT="$SITE_URL/releases/$DOCS_VERSION"
+              NOINDEX=true
+              ;;
+            release)
+              WEB_ROOT="$SITE_URL/releases/$DOCS_VERSION"
+              NOINDEX=false
+              ;;
+            *)
+              WEB_ROOT="$SITE_URL"
+              NOINDEX=true
+              ;;
+          esac
+
+          perl -0pi -e '
+            s/(<instance\b[^>]*?)\s+web-path="[^"]*"([^>]*>)/$1$2/g;
+            s/(<instance\b[^>]*?)\s+version="[^"]*"([^>]*>)/$1$2/g;
+            s/(<instance\b[^>]*?)\s+versionName="[^"]*"([^>]*>)/$1$2/g;
+          ' "$WRITERSIDE_DIR/writerside.cfg"
+
+          DOCS_WEB_ROOT="$WEB_ROOT" \
+          DOCS_NOINDEX="$NOINDEX" \
+          DOCS_SITE_URL="$SITE_URL" \
+          perl -0pi -e '
+            if (!s#<web-root>[^<]*</web-root>#<web-root>$ENV{DOCS_WEB_ROOT}</web-root>#) {
+              s#<variables>#<variables>\n        <web-root>$ENV{DOCS_WEB_ROOT}</web-root>#;
+            }
+            if (!s#<versions-switcher>[^<]*</versions-switcher>#<versions-switcher>$ENV{DOCS_SITE_URL}/versions.json</versions-switcher>#) {
+              s#<variables>#<variables>\n        <versions-switcher>$ENV{DOCS_SITE_URL}/versions.json</versions-switcher>#;
+            }
+            s#<noindex-content>[^<]*</noindex-content>#<noindex-content>$ENV{DOCS_NOINDEX}</noindex-content>#;
+          ' "$WRITERSIDE_DIR/cfg/buildprofiles.xml"
+
+      - name: Build documentation
+        uses: JetBrains/writerside-github-action@v4
+        with:
+          instance: ${{ env.INSTANCE }}
+          docker-version: ${{ env.DOCKER_VERSION }}
+
+      - name: Check Writerside report
+        uses: JetBrains/writerside-checker-action@v1
+        with:
+          instance: ${{ env.INSTANCE }}
+
+      - name: Upload ${{ matrix.docs.id }} build results
+        uses: actions/upload-artifact@v7
+        with:
+          name: docs-${{ matrix.docs.id }}
+          path: artifacts/*
+          retention-days: 7
+
+  deploy:
+    if: needs.prepare.outputs.deploy == 'true'
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      pages: write
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          path: source
+
+      - name: Check for the Pages content store
+        id: content-store
+        shell: bash
+        run: |
+          if git -C source ls-remote --exit-code origin "refs/heads/$CONTENT_BRANCH" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout Pages content store
+        if: steps.content-store.outputs.exists == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.content-branch }}
+          fetch-depth: 1
+          path: published
+
+      - name: Create Pages content store
+        if: steps.content-store.outputs.exists != 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: published
+
+      - name: Initialise Pages content store
+        if: steps.content-store.outputs.exists != 'true'
+        shell: bash
+        run: |
+          git -C published switch --orphan "$CONTENT_BRANCH"
+          git -C published rm -rf . >/dev/null 2>&1 || true
+
+      - name: Download documentation builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: docs-*
+          path: artifacts
+
+      - name: Assemble versioned website
+        shell: bash
+        env:
+          ROOT_ID: ${{ needs.prepare.outputs.root_id }}
+          ROOT_VERSION: ${{ needs.prepare.outputs.root_version }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
+          RELEASE_LABEL: ${{ needs.prepare.outputs.release_label }}
+        run: |
+          set -euo pipefail
+
+          SITE_URL="${SITE_URL%/}"
+          INSTANCE_ID="${INSTANCE##*/}"
+          INSTANCE_ID_UPPER=$(printf '%s' "$INSTANCE_ID" | tr '[:lower:]' '[:upper:]')
+          BUILD_ARCHIVE="webHelp${INSTANCE_ID_UPPER}2-all.zip"
+          set_version_label() {
+            local config_file="$1"
+            local version_label="$2"
+            local config_temp="${config_file}.tmp"
+
+            jq --compact-output --arg version "$version_label" \
+              '.productVersion = $version | .productVersionName = $version' \
+              "$config_file" > "$config_temp"
+            mv "$config_temp" "$config_file"
+          }
+
+          ROOT_BUILD=$(mktemp -d)
+          unzip -O UTF-8 -qq "artifacts/docs-${ROOT_ID}/${BUILD_ARCHIVE}" -d "$ROOT_BUILD"
+
+          # Replace production files while retaining all versioned directories.
+          rsync -a --delete \
+            --exclude='/.git/' \
+            --exclude='/develop/' \
+            --exclude='/releases/' \
+            --exclude='/versions.json' \
+            --exclude='/CNAME' \
+            --exclude='/.nojekyll' \
+            "$ROOT_BUILD/" published/
+
+          rm -rf published/develop
+          mkdir -p published/develop
+          unzip -O UTF-8 -qq "artifacts/docs-develop/${BUILD_ARCHIVE}" -d published/develop
+
+          if [[ -n "$RELEASE_ID" ]]; then
+            VERSION_LABEL_FILE="published/releases/$RELEASE_VERSION/.docs-version-label"
+            EXISTING_RELEASE_LABEL=""
+            [[ -f "$VERSION_LABEL_FILE" ]] && EXISTING_RELEASE_LABEL=$(<"$VERSION_LABEL_FILE")
+
+            if [[ "$RELEASE_LABEL" == *" Preview" && -n "$EXISTING_RELEASE_LABEL" && "$EXISTING_RELEASE_LABEL" != *" Preview" ]]; then
+              echo "Keeping the published $RELEASE_VERSION release instead of replacing it with a preview."
+            else
+              rm -rf "published/releases/$RELEASE_VERSION"
+              mkdir -p "published/releases/$RELEASE_VERSION"
+              unzip -O UTF-8 -qq \
+                "artifacts/docs-${RELEASE_ID}/${BUILD_ARCHIVE}" \
+                -d "published/releases/$RELEASE_VERSION"
+              printf '%s\n' "$RELEASE_LABEL" > "$VERSION_LABEL_FILE"
+              set_version_label \
+                "published/releases/$RELEASE_VERSION/config.json" \
+                "$RELEASE_LABEL"
+            fi
+          fi
+
+          if [[ -z "$ROOT_VERSION" ]]; then
+            git -C source fetch --force --tags origin \
+              "+refs/heads/${CURRENT_BRANCH}:refs/remotes/origin/${CURRENT_BRANCH}"
+            ROOT_VERSION=$(git -C source tag \
+              --merged "refs/remotes/origin/$CURRENT_BRANCH" \
+              --list 'v[0-9]*' \
+              --sort=-version:refname | sed -n '1p')
+            ROOT_VERSION="${ROOT_VERSION#v}"
+          fi
+          CURRENT_LABEL="Current${ROOT_VERSION:+ ($ROOT_VERSION)}"
+
+          # Writerside only renders its native version control when
+          # productVersion is nonempty. Patch the runtime configuration after
+          # the build so canonical URLs continue to use the deployed paths.
+          set_version_label published/config.json "$CURRENT_LABEL"
+          set_version_label published/develop/config.json "Develop"
+
+          # Writerside resolves version URLs from the host root, so include the site's base path.
+          {
+            printf 'Develop\t/develop/\tfalse\n'
+            printf '%s\t/\ttrue\n' "$CURRENT_LABEL"
+            if [[ -d published/releases ]]; then
+              while IFS= read -r version; do
+                label="$version"
+                if [[ -f "published/releases/$version/.docs-version-label" ]]; then
+                  label=$(<"published/releases/$version/.docs-version-label")
+                fi
+                if [[ -f "published/releases/$version/config.json" ]]; then
+                  set_version_label "published/releases/$version/config.json" "$label"
+                fi
+                printf '%s\t/releases/%s/\tfalse\n' "$label" "$version"
+              done < <(
+                for release_dir in published/releases/*; do
+                  [[ -d "$release_dir" ]] && basename "$release_dir"
+                done | sort -Vr
+              )
+            fi
+          } | jq -Rn --arg siteUrl "$SITE_URL" '
+            ($siteUrl | sub("^https?://[^/]+"; "") | rtrimstr("/")) as $sitePath
+            | [
+              inputs
+              | split("\t")
+              | {version: .[0], url: ($sitePath + .[1]), isCurrent: (.[2] == "true")}
+            ]
+          ' > published/versions.json
+
+          touch published/.nojekyll
+          if [[ -n "$CUSTOM_DOMAIN" ]]; then
+            printf '%s\n' "$CUSTOM_DOMAIN" > published/CNAME
+          fi
+
+      - name: Save Pages content store
+        shell: bash
+        env:
+          PUBLISH_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          git -C published config user.name "github-actions[bot]"
+          git -C published config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C published add -A
+
+          if git -C published diff --cached --quiet; then
+            echo "The published documentation is already up to date."
+          else
+            git -C published commit -m "Publish documentation from ${PUBLISH_REF}"
+            git -C published push origin "HEAD:$CONTENT_BRANCH"
+          fi
+
+      - name: Prepare Pages artifact
+        shell: bash
+        run: |
+          mkdir site
+          rsync -a --exclude='/.git/' published/ site/
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
