@@ -313,7 +313,7 @@ jobs:
 
       - name: Checkout Pages content store
         if: steps.content-store.outputs.exists == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.content-branch }}
           fetch-depth: 1
@@ -321,7 +321,7 @@ jobs:
 
       - name: Create Pages content store
         if: steps.content-store.outputs.exists != 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
           path: published
