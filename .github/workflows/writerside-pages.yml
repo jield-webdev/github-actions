@@ -334,7 +334,7 @@ jobs:
           git -C published rm -rf . >/dev/null 2>&1 || true
 
       - name: Download documentation builds
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: docs-*
           path: artifacts
